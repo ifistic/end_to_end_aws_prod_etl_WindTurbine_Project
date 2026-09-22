@@ -1,274 +1,439 @@
-# Wind Turbine Data Pipeline
+# Wind Turbine Anomaly Detection: End-to-End AWS Production ETL Pipeline
 
-A PySpark-based medallion architecture (Bronze - Silver - Gold) pipeline that ingests raw wind turbine sensor readings, cleans and validates the data, computes summary statistics and anomaly detection, and stores the results in PostgreSQL for further analysis.
+A production-grade, event-driven data pipeline that ingests wind turbine sensor
+readings, applies a medallion architecture (Bronze to Silver to Gold) using PySpark,
+detects power output anomalies, and stores results in Amazon RDS PostgreSQL and S3
+Parquet. All infrastructure is provisioned with Terraform and destroyable with one command.
+
+---
 
 ## Architecture
 
-```
-Raw CSV (zip, downloaded locally) into  Bronze, Silver, Gold
-```
+    Local Downloads/
+          |
+          |  downloads_to_s3.py (laptop agent)
+          v
+    S3 landing/
+          |
+          |  EventBridge (Object Created)
+          v
+    AWS Lambda: ingest_trigger
+      - Validates file headers
+      - Unpacks zip to raw CSVs
+      - Moves original to archive/ or quarantine/ if invalid
+      - Starts Glue job or queues a rerun if already running
+          |
+          v
+    S3 raw/ (validated CSVs)
+          |
+          |  AWS Glue 5.0 PySpark runs unmodified main.py
+          v
+    Medallion Architecture
+      Bronze -> Silver -> Gold
+          |
+          |-- S3 curated/latest/ (Parquet)
+          +-- RDS PostgreSQL
+                - Processed_data
+                - gold_summary_statistics
+                - gold_anomalies
+          |
+          v
+    AWS Lambda: post_run + SNS alerts
 
-- **Bronze**: Lands raw CSV files from source (unzipped from the source archive), tags rows with ingestion metadata.
-- **Silver**: Cleans data (deduplication, null handling, imputation of missing sensor values, invalid-value removal), rounds numeric columns to 4 decimal places, writes to Parquet and PostgreSQL.
-- **Gold**: Computes daily summary statistics (min/max/avg/stddev power output per turbine) and detects anomalies (readings outside 2 standard deviations from the mean, within the same 24-hour window). Both are written to Parquet and PostgreSQL.
+Alternative compute: the same main.py runs unchanged on Amazon EMR.
 
-## Prerequisites
+---
+
+## Technologies
+
+| Layer          | Technology                                        |
+|----------------|---------------------------------------------------|
+| Processing     | PySpark (AWS Glue 5.0 / Amazon EMR 7.5)          |
+| Orchestration  | AWS Lambda (Python 3.12), Amazon EventBridge      |
+| Storage        | Amazon S3 (data lake), RDS PostgreSQL db.t3.micro |
+| Infrastructure | Terraform 1.10+ (10 reusable modules)             |
+| Alerting       | Amazon SNS                                        |
+| Secrets        | AWS Secrets Manager                               |
+| Networking     | VPC, private subnets, VPC endpoints, bastion EC2  |
+| DB client      | DBeaver via SSH tunnel through bastion            |
+| Local agent    | Python boto3 uploader script                      |
+
+---
+
+## Repository Structure
+
+    wind_turbine_challenge_2026/
+    |-- main.py                     Pipeline entry point (local or AWS)
+    |-- requirements.txt
+    |-- .env                        Local DB credentials (gitignored)
+    |-- src/
+    |   |-- ingestion/ingest.py     Unzips source data, reads CSVs
+    |   |-- pipelines/
+    |   |   |-- bronze.py           Lands raw files, adds metadata
+    |   |   |-- silver.py           Cleans data, writes to Parquet + PostgreSQL
+    |   |   +-- gold.py             Summary statistics + anomaly detection
+    |   |-- processing/
+    |   |   |-- cleaning.py         Dedup, null handling, imputation
+    |   |   |-- statistics.py       Windowed min/max/avg/stddev per turbine
+    |   |   +-- anomaly.py          2-stddev anomaly detection per turbine
+    |   +-- utils/
+    |       |-- config.py           Central config: paths, thresholds, DB
+    |       +-- helpers.py          Shared write and metadata utilities
+    |-- aws_dropin/                 AWS adapter layer (src/ unchanged)
+    |   |-- glue/aws_entrypoint.py  Glue/EMR entry: calls main.main()
+    |   |-- lambda/
+    |   |   |-- ingest_trigger/     Validates files, starts Glue
+    |   |   |-- post_run/           Starts queued reruns
+    |   |   +-- snowflake_loader/   Optional Snowflake loader
+    |   |-- local_agent/            Watches Downloads/, uploads to S3
+    |   |-- emr/                    EMR bootstrap + launcher
+    |   |-- snowflake/setup.sql     One-time Snowflake setup
+    |   +-- scripts/build.sh        Packages app.zip + wheels
+    +-- terraform-wind-turbine/
+        |-- Makefile               make bootstrap, apply, destroy
+        |-- bootstrap/             Creates S3 state bucket (run once)
+        |-- environments/dev/      Dev environment root
+        +-- modules/
+            |-- network/           VPC, subnets, endpoints, bastion
+            |-- storage/           S3 data lake + scripts bucket
+            |-- database/          RDS PostgreSQL + credentials secret
+            |-- alerting/          SNS topic + email subscription
+            |-- artifacts/         Uploads app.zip, wheels to S3
+            |-- glue_pipeline/     Glue job, IAM role, VPC connection
+            |-- orchestration/     Lambda + EventBridge rules
+            |-- snowflake_loader/  Optional Snowflake loader Lambda
+            |-- uploader/          IAM user for laptop uploader
+            +-- emr/              Optional EMR roles + security groups
+
+---
+
+## Part 1: Run Locally
+
+### Prerequisites
 
 - Python 3.12+
-- Java (required by PySpark) — check with `java -version`
+- Java (required by PySpark): check with java -version
 - PostgreSQL 16+
 - Git
-- VS Code (or any editor of your choice)
-
-## Setup
 
 ### 1. Clone the repository
 
-```bash
-git clone https://github.com/ifistic/wind_turbine_challenge_2026.git
-cd wind_turbine_challenge_2026
-```
+    git clone https://github.com/ifistic/end_to_end_aws_prod_etl_WindTurbine_Project.git
+    cd end_to_end_aws_prod_etl_WindTurbine_Project
 
 ### 2. Create and activate a virtual environment
 
-```bash
-python3 -m venv project_venv
-source project_venv/bin/activate
-```
+    python3 -m venv project_venv
+    source project_venv/bin/activate
 
 ### 3. Install Python dependencies
 
-```bash
-pip install -r requirements.txt
-```
+    pip install -r requirements.txt
 
 ### 4. Install and start PostgreSQL
 
-```bash
-# Linux
-sudo apt install postgresql
-sudo systemctl start postgresql
-```
+    sudo apt install postgresql
+    sudo systemctl start postgresql
+    sudo -u postgres createdb wind_turbine_db
+    sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
 
-Confirm which port your cluster is running on (this project assumes the default `5432`, but **double-check** — some setups may use a non-default port):
+### 5. Configure environment variables
 
-```bash
-pg_lsclusters
-```
+Create a .env file in the project root:
 
-### 5. Create the database and set a password
+    POSTGRES_HOST=localhost
+    POSTGRES_PORT=5432
+    POSTGRES_DB=wind_turbine_db
+    POSTGRES_USER=postgres
+    POSTGRES_PASSWORD=postgres
 
-```bash
-sudo -u postgres createdb wind_turbine_db
-sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
-```
+### 6. Add raw data
 
-> The password above (`postgres`) is an example only — use a real password if this database will hold anything sensitive, and make sure it matches what you put in `.env` in step 6.
+Place data.zip containing data_group_1.csv, data_group_2.csv and
+data_group_3.csv into your ~/Downloads/ folder.
 
-### 5.5. Allow password-based local connections (pg_hba.conf) and troubleshooting
+### 7. Run the pipeline
 
-Fresh PostgreSQL installs sometimes ship with `pg_hba.conf` rules that don't include a plain `127.0.0.1` entry (e.g. only allowing a specific external IP or IPv6 loopback), which causes a `FATAL: no pg_hba.conf entry for host "127.0.0.1"` error even with a correct password. Check first:
+    python main.py
 
-```bash
-sudo cat /etc/postgresql/16/main/pg_hba.conf | grep -v "^#" | grep -v "^$"
-```
+This runs all stages and writes:
+- Parquet files to data/bronze/, data/silver/, data/gold/
+- Tables to PostgreSQL: Processed_data, gold_summary_statistics, gold_anomalies
 
-If there's no line matching `host    all    all    127.0.0.1/32    ...`, add one:
+### 8. Query locally
 
-```bash
-sudo nano /etc/postgresql/16/main/pg_hba.conf
-```
+    psql -h localhost -U postgres -d wind_turbine_db
 
-Add this line (near the other `host` entries):
+    SELECT COUNT(*) FROM "Processed_data";
+    SELECT COUNT(*) FROM gold_anomalies;
+    SELECT turbine_id, COUNT(*) FROM gold_anomalies GROUP BY turbine_id ORDER BY 1;
 
-```
-host    all             all             127.0.0.1/32            scram-sha-256
-```
+---
 
-Save (`Ctrl+O`, `Enter`, `Ctrl+X` in nano), then restart PostgreSQL to apply it:
+## Part 2: Deploy to AWS
 
-```bash
-sudo systemctl restart postgresql
-```
+### Prerequisites
 
-### 6. Configure environment variables
+- AWS account with an IAM admin user (not root)
+- AWS CLI v2 installed and configured
+- Terraform 1.10+
+- Python 3.x
 
-Create a `.env` file in the project root:
+### Step 1: Bootstrap remote state (run once only)
 
-```bash
-cat > .env << 'EOF'
-POSTGRES_HOST=localhost
-POSTGRES_PORT=5432
-POSTGRES_DB=wind_turbine_db
-POSTGRES_USER=postgres
-POSTGRES_PASSWORD=postgres
-EOF
-```
+    cd terraform-wind-turbine
+    terraform -chdir=bootstrap init
+    terraform -chdir=bootstrap apply
 
-> **Note:** if `pg_lsclusters` in step 4 showed a different port (e.g. `5433`), update `POSTGRES_PORT` in `.env` to match. A mismatched port is the most common cause of connection failures.
+This writes environments/dev/backend.hcl automatically.
 
-### 7. Add the raw data source
+### Step 2: Create EC2 key pair for bastion SSH
 
-`src/ingestion/ingest.py` reads the source archive from `~/Downloads/data.zip` by default (update `SOURCE_ZIP` in `src/utils/config.py` if yours lives elsewhere). On first run, the pipeline automatically unzips it into  Bronze layer and lands a copy of those CSVs into `data/bronze/`.
+    aws ec2 create-key-pair \
+      --key-name wind-turbine-bastion \
+      --query KeyMaterial \
+      --output text \
+      --profile YOUR_ADMIN_PROFILE > ~/.ssh/wind-turbine-bastion.pem
 
-## Running the pipeline
+    chmod 400 ~/.ssh/wind-turbine-bastion.pem
 
-```bash
-python main.py
-```
+### Step 3: Get your public IP
 
-This runs all four stages in sequence — Raw ingestion, Bronze, Silver, Gold — printing progress and sample output at each step, and writes:
+    curl https://checkip.amazonaws.com
 
-- Parquet files to `data/bronze/`, `data/silver/`, `data/gold/`
-- Database tables to PostgreSQL: `Processed_data` (cleaned Silver data), `gold_summary_statistics`, `gold_anomalies`
+### Step 4: Configure your environment
 
-## Querying the data in PostgreSQL
+    cp environments/dev/terraform.tfvars.example environments/dev/terraform.tfvars
+    nano environments/dev/terraform.tfvars
 
-### Option A — `psql` (command line)
+Set these values:
 
-Connect:
+    alert_email       = "your@email.com"
+    create_bastion    = true
+    bastion_key_name  = "wind-turbine-bastion"
+    my_ip_cidr        = "YOUR_IP/32"
+    db_instance_class = "db.t3.micro"
 
-```bash
-psql -h localhost -U postgres -d wind_turbine_db
-```
+### Step 5: Build artefacts
 
-(add `-p 5433` if your cluster runs on a non-default port — see step 4 above)
+    bash aws_dropin/scripts/build.sh
 
-Useful queries once connected:
+### Step 6: Deploy all infrastructure
 
-```sql
--- List all tables
-\dt
+    cd environments/dev
+    terraform init -backend-config=backend.hcl
+    terraform apply
 
--- Preview cleaned data
-SELECT * FROM "Processed_data" LIMIT 10;
+Type yes when prompted. RDS takes about 6 minutes. Outputs at the end:
 
--- Row count
-SELECT COUNT(*) FROM "Processed_data";
+    bastion_public_ip      = x.x.x.x
+    data_lake_bucket       = wind-turbine-pipeline-xxxxxxxx
+    rds_endpoint           = wind-turbine-pipeline-dev.xxxx.eu-west-2.rds.amazonaws.com:5432
+    glue_pipeline_job_name = wind-turbine-pipeline-pipeline
+    uploader_access_key_id = AKIAxxxxxxxxxxxxxxxx
 
--- Summary stats for a specific turbine
-SELECT * FROM gold_summary_statistics WHERE turbine_id = 1 ORDER BY window_start;
+### Step 7: Configure the laptop uploader
 
--- All flagged anomalies
-SELECT * FROM gold_anomalies ORDER BY turbine_id, timestamp;
+    terraform output -raw uploader_secret_access_key
+    aws configure --profile turbine-uploader
 
--- Which turbines have the most anomalies?
-SELECT turbine_id, COUNT(*) AS anomaly_count
-FROM gold_anomalies
-GROUP BY turbine_id
-ORDER BY anomaly_count DESC;
+Enter the access key ID from Terraform output and the secret key from above.
+Region: eu-west-2. Output format: json.
 
--- Exit
-\q
-```
+### Step 8: Confirm SNS email subscription
 
-> If a query's output looks paused with no way to type, press `q` to exit the pager. If column headers are missing from results, run `\pset tuples_only off`.
+Check your email for an AWS notification and click Confirm subscription.
+Without this you will not receive pipeline alerts.
 
-### Option B — DBeaver (GUI)
+### Step 9: Run the pipeline
 
-1. Install: `sudo snap install dbeaver-ce`
-2. Launch: `dbeaver &`
-3. **Database → New Database Connection → PostgreSQL**
-4. Connection details:
+Place data.zip in ~/Downloads/ then:
 
-   | Field | Value |
-   |---|---|
-   | Host | `localhost` |
-   | Port | `5432` (or your actual port from `pg_lsclusters`) |
-   | Database | `wind_turbine_db` |
-   | Username | `postgres` |
-   | Password | `postgres` |
+    AWS_PROFILE=turbine-uploader python3 aws_dropin/local_agent/downloads_to_s3.py \
+      --bucket YOUR_DATA_LAKE_BUCKET \
+      --once
 
-5. Test Connection → Finish
-6. Browse tables under `wind_turbine_db → Schemas → public → Tables`
+This uploads to S3 landing/ and triggers the full pipeline automatically.
 
-### Option C — Python / pandas
+### Step 10: Monitor
 
-```python
-import pandas as pd
-from sqlalchemy import create_engine
+    aws glue get-job-runs \
+      --job-name wind-turbine-pipeline-pipeline \
+      --max-results 1 \
+      --query 'JobRuns[0].{Status:JobRunState,Started:StartedOn,Completed:CompletedOn}' \
+      --profile YOUR_ADMIN_PROFILE
 
-engine = create_engine("postgresql://postgres:postgres@localhost:5432/wind_turbine_db")
-df = pd.read_sql("SELECT * FROM gold_summary_statistics", engine)
-print(df.head())
-```
+The Glue job takes about 3 minutes. You will receive an email when it completes.
 
-## Project structure
+---
 
-```
-.
-├── artifacts/                # Spark runtime temp/event-log directory (auto-generated)
-├── data/
-│   ├── bronze/                # Landed raw CSVs (verbatim copies from raw_data/)
-│   │   ├── data_group_1.csv
-│   │   ├── data_group_2.csv
-│   │   └── data_group_3.csv
-│   ├── gold/
-│   │   ├── anomalies/          # Parquet: flagged anomalous readings
-│   │   │   ├── part-*.snappy.parquet
-│   │   │   └── _SUCCESS
-│   │   └── summary_statistics/ # Parquet: daily min/max/avg/stddev per turbine
-│   │       ├── part-*.snappy.parquet
-│   │       └── _SUCCESS
-│   ├── silver/                 # Parquet: cleaned turbine readings
-│   │   ├── part-*.snappy.parquet
-│   │   └── _SUCCESS
-│   └── wind_turbine.db          # Legacy SQLite artifact (project now uses PostgreSQL)
-├── main.py                     # Entry point — runs the full pipeline
-├── raw_data/                    # Unzipped source CSVs
-│   ├── data_group_1.csv
-│   ├── data_group_2.csv
-│   └── data_group_3.csv
-├── README.md
-├── requirements.txt
-├── src/
-│   ├── ingestion/
-│   │   ├── ingest.py            # Unzips source data, reads raw CSVs into Spark
-│   │   └── __init__.py
-│   ├── __init__.py
-│   ├── pipelines/
-│   │   ├── bronze.py            # Lands raw files, adds ingestion metadata
-│   │   ├── gold.py              # Orchestrates summary statistics + anomaly detection
-│   │   ├── __init__.py
-│   │   └── silver.py            # Cleans data, writes to Parquet + PostgreSQL
-│   ├── processing/
-│   │   ├── anomaly.py           # 2-stddev anomaly detection, windowed per turbine
-│   │   ├── cleaning.py          # Dedup, null handling, imputation, rounding
-│   │   ├── __init__.py
-│   │   └── statistics.py        # Windowed min/max/avg/stddev per turbine
-│   └── utils/
-│       ├── config.py            # Central configuration (paths, thresholds, DB credentials)
-│       ├── helpers.py           # Shared write/metadata utilities
-│       └── __init__.py
-└── tests/
-    └── __init__.py
-```
+## Connecting DBeaver to RDS via SSH Tunnel
 
-## Solution Design & Assumptions
+RDS is in a private subnet with no public IP. DBeaver connects through
+the bastion EC2 instance using an SSH tunnel.
 
-### Design
+### Get the RDS password
 
-The solution is implemented entirely in Python, using **PySpark** as the core processing engine and a **medallion architecture** (Bronze, Silver, Gold) to separate raw ingestion, cleaning, and analytics-ready output into distinct, auditable stages.
+    aws secretsmanager get-secret-value \
+      --secret-id wind-turbine-pipeline/dev/db-credentials \
+      --query SecretString \
+      --output text \
+      --profile YOUR_ADMIN_PROFILE
 
-- **Why PySpark**: the brief allows any framework; PySpark was chosen for its native support of windowed aggregations (`F.window()`), which map directly onto the "over a given time period (e.g., 24 hours)" requirement for both summary statistics and anomaly detection, and because it scales beyond the current dataset size without a rewrite.
-- **Why a medallion architecture**: keeping raw, cleaned, and aggregated data in separate layers means each stage is independently inspectable and re-runnable. Bronze preserves an untouched audit trail of the source files, Silver is the single source of truth for "cleaned data," and Gold contains only derived analytics, so a bug in aggregation logic never risks corrupting the underlying cleaned data.
-- **Cleaning approach**: missing values are imputed using the **per-turbine mean** (not a global mean), since different turbines can have systematically different output profiles (location, model, orientation); using a global average would bias imputed values toward whichever turbines dominate the dataset. Rows where a value was imputed are flagged with an `is_imputed` boolean column, so downstream consumers can distinguish real observed readings from filled-in ones.
-- **Anomaly detection**: computed **per turbine, per time window** (not per turbine across the whole dataset, and not across all turbines combined), so a turbine's readings are only ever compared against its own recent behavior. This avoids flagging normal seasonal or daily variation as anomalous, and avoids one turbine's baseline being skewed by another's.
-- **Storage**: PostgreSQL was used for the "store in a database for further analysis" requirement, chosen over SQLite for its native support of fixed-precision `NUMERIC` types (avoiding Python `Decimal`-to-driver binding issues) and because it's a more realistic choice for a production-style analytics database than a single local file.
+### DBeaver Main tab
 
-### Assumptions
+| Field    | Value                                          |
+|----------|------------------------------------------------|
+| Host     | rds_endpoint value without the :5432           |
+| Port     | 5432                                           |
+| Database | wind_turbine_db                                |
+| Username | postgres                                       |
+| Password | password from the secretsmanager command above |
 
-- **Timestamp granularity**: source readings are hourly; the "24-hour period" in the brief is interpreted as a calendar-day tumbling window per turbine (`F.window(timestamp, "1 day")`), not a rolling 24-hour lookback from each reading.
-- **Turbine operating limits**: physically invalid values (wind speed, power output bounds) are nulled out using placeholder turbine specification limits (e.g. rated capacity, cut-out wind speed) rather than a supplied spec sheet, since none was provided with the dataset — these should be replaced with manufacturer-supplied values in a production setting.
-- **Anomaly threshold**: fixed at exactly 2 standard deviations from the mean, per the brief's explicit definition, rather than treated as a tunable parameter — though it is exposed as a config value (`ANOMALY_STD_THRESHOLD`) for easy adjustment if requirements change.
-- **Duplicate readings**: a duplicate is defined as matching `(turbine_id, timestamp)` — that is, a turbine should report at most one reading per timestamp; if two rows share both fields, one is dropped.
-- **Missing vs. invalid values**: both are handled identically (imputed with the per-turbine mean) rather than treated as separate cases, since the brief groups them together ("missing values and outliers, which must be removed or imputed").
-- **Anomalies in the database**: the requirement to "store the cleaned data and summary statistics" is interpreted as reasonably extending to storing detected anomalies too, since anomalies are themselves a first-class derived output the brief asks the pipeline to produce, even though the storage requirement's wording technically names only cleaned data and summary statistics.
-- **Imputed values can be flagged as anomalous**: because imputed rows use the same per-window mean that anomaly bounds are calculated from, a day with many imputed readings can artificially shrink that day's standard deviation, making genuine sensor readings more likely to fall outside the bounds. The `is_imputed` flag lets this be filtered or accounted for during analysis.
+### DBeaver SSH tab: tick Use SSH tunnel
+
+| Field          | Value                             |
+|----------------|-----------------------------------|
+| Host/IP        | bastion_public_ip from tf output  |
+| Port           | 22                                |
+| Username       | ec2-user                          |
+| Authentication | Public Key                        |
+| Private key    | ~/.ssh/wind-turbine-bastion.pem   |
+| Passphrase     | leave blank                       |
+
+Untick Use SSL on the SSL tab. Click Test Connection.
+
+### Useful SQL queries
+
+    -- All tables
+    SELECT table_name FROM information_schema.tables WHERE table_schema = 'public';
+
+    -- Cleaned readings count
+    SELECT COUNT(*) FROM "Processed_data";
+
+    -- Anomaly count per turbine
+    SELECT turbine_id, COUNT(*) AS anomaly_count
+    FROM gold_anomalies GROUP BY turbine_id ORDER BY turbine_id;
+
+    -- Daily summary statistics
+    SELECT turbine_id, window_start, avg_power_mw, stddev_power_mw
+    FROM gold_summary_statistics ORDER BY turbine_id, window_start;
+
+    -- Anomalous readings
+    SELECT turbine_id, timestamp, power_output, mean_power_mw,
+           lower_bound_mw, upper_bound_mw
+    FROM gold_anomalies WHERE is_anomaly = true
+    ORDER BY turbine_id, timestamp LIMIT 20;
+
+---
+
+## S3 Output Structure
+
+    s3://wind-turbine-pipeline-xxxxxxxx/
+    |-- landing/      files uploaded from laptop
+    |-- archive/      originals after successful processing
+    |-- quarantine/   files rejected for invalid headers
+    |-- raw/          validated CSVs input to every Glue run
+    |-- control/      rerun marker
+    +-- curated/
+        |-- runs/run_id/bronze/ silver/ gold/
+        +-- latest/bronze/ silver/ gold/anomalies/ summary_statistics/
+
+---
+
+## Running on EMR: Alternative to Glue
+
+The same main.py runs unchanged on Amazon EMR.
+
+    # Enable EMR in terraform.tfvars
+    enable_emr = true
+
+    # Apply to create NAT gateway, EMR roles and security groups
+    cd terraform-wind-turbine/environments/dev
+    terraform apply
+
+    # Launch a self-terminating EMR cluster
+    bash aws_dropin/emr/run_on_emr.sh
+
+Wait for TERMINATED before destroying:
+
+    aws emr list-clusters --active --profile YOUR_ADMIN_PROFILE
+
+---
+
+## Destroying All Resources
+
+    cd terraform-wind-turbine/environments/dev
+    terraform destroy
+
+All AWS resources are removed. The S3 state bucket survives so you can rebuild.
+
+Rebuild at any time in about 8 minutes:
+
+    bash aws_dropin/scripts/build.sh
+    cd terraform-wind-turbine/environments/dev
+    terraform apply
+
+---
+
+## Cost Estimate: eu-west-2
+
+| Resource                            | Cost per month running 24/7 |
+|-------------------------------------|-----------------------------|
+| RDS db.t3.micro                     | ~15 USD                     |
+| VPC Interface Endpoints x2 x2 AZ   | ~29 USD                     |
+| EC2 t3.nano bastion                 | ~4 USD                      |
+| S3, Lambda, EventBridge, SNS        | ~1 USD                      |
+| Glue job                            | 0 USD idle, 0.44/DPU-hr/run |
+| Total                               | ~49 USD per month           |
+
+Run terraform destroy when not using the project. Costs drop to zero.
+Rebuild with terraform apply in about 8 minutes when needed.
+
+---
+
+## Pipeline Design Notes
+
+### Why PySpark
+PySpark native F.window() maps directly onto the 24-hour period requirement
+for summary statistics and anomaly detection. Scales beyond the current
+dataset without a rewrite.
+
+### Why Medallion Architecture
+Keeping raw, cleaned and aggregated data in separate layers means each stage
+is independently inspectable and re-runnable. A bug in aggregation logic never
+risks corrupting the underlying cleaned data.
+
+### Why the Same Code Runs on Glue and EMR
+aws_entrypoint.py recreates the local environment inside AWS:
+1. Downloads app.zip containing main.py and src/ from S3
+2. Reads RDS credentials from Secrets Manager, exports as POSTGRES_* env vars
+3. Downloads CSVs from S3 raw/ to local /tmp/raw_data/
+4. Pre-creates a local Spark session
+5. Calls main.main() so your code never knows it is in AWS
+6. Uploads data/bronze, silver and gold back to S3
+
+### Anomaly Detection
+Per turbine per 24-hour window. A reading is flagged if it falls outside
+mean plus or minus 2 times stddev for that turbine on that day.
+Configurable via ANOMALY_STD_THRESHOLD in src/utils/config.py.
+
+### Cleaning Strategy
+Missing values are imputed using the per-turbine mean rather than a global mean
+because different turbines have different output profiles. Imputed rows are
+flagged with is_imputed = true so downstream consumers can filter them.
+
+---
 
 ## Troubleshooting
 
-- **`ModuleNotFoundError: No module named 'src'`** — run scripts as modules from the project root (`python -m src.processing.cleaning`), not by path.
-- **`FATAL: password authentication failed`** — check for multiple PostgreSQL instances running at once (`pg_lsclusters`, `sudo ss -ltnp | grep 5432`) and confirm `.env`'s `POSTGRES_PORT` matches the actual running cluster's port.
-- **`FATAL: no pg_hba.conf entry for host "127.0.0.1"...`** — the password is correct but PostgreSQL has no rule permitting the connection at all. See setup step 5.5 — add a `host all all 127.0.0.1/32 scram-sha-256` line to `pg_hba.conf` and restart PostgreSQL.
-- **`._data_group_*.csv` files with 0 rows** — macOS zip metadata junk (AppleDouble files); safe to delete from `raw_data/` and `data/bronze/`.
+| Problem                                  | Fix                                                         |
+|------------------------------------------|-------------------------------------------------------------|
+| ModuleNotFoundError: No module named src | Run from project root: python main.py                       |
+| FATAL: password authentication failed    | Check .env matches your PostgreSQL password                 |
+| DBeaver Read timed out                   | Check RDS status in the AWS console                         |
+| DBeaver Connection timed out             | IP changed: update my_ip_cidr in terraform.tfvars and apply |
+| Glue job FAILED                          | Check CloudWatch: /aws-glue/jobs/wind-turbine-pipeline      |
+| SignatureDoesNotMatch in uploader        | Reconfigure: aws configure --profile turbine-uploader       |
+| File goes to quarantine                  | CSV must have: timestamp, turbine_id, wind_speed, wind_direction, power_output |
+| Secret already scheduled for deletion    | aws secretsmanager delete-secret --secret-id wind-turbine-pipeline/dev/db-credentials --force-delete-without-recovery then re-apply |
