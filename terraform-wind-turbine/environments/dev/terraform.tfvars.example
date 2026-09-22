@@ -1,0 +1,20 @@
+# Copy to terraform.tfvars (gitignored) and edit.
+
+alert_email = "you@example.com"
+
+# Whether Terraform manages the laptop uploader's access key.
+# true means the secret is stored in your Terraform state file.
+create_uploader_access_key = true
+
+# Only turn this on if nothing else in this AWS account and region uses Glue.
+cleanup_shared_glue_log_groups = false
+
+# EMR option (adds a NAT gateway, billed hourly).
+enable_emr = false
+
+# Snowflake option.
+enable_snowflake           = false
+snowflake_account          = "xy12345.eu-west-2.aws"
+snowflake_private_key_path = "~/keys/loader_key.p8"
+snowflake_iam_user_arn     = ""
+snowflake_external_id      = ""

@@ -1,0 +1,4 @@
+# build/ holds artefacts made by scripts/build.sh (app.zip, wheels, layer zip).
+# They're big, machine-specific, and rebuilt on demand, so they don't belong
+# in git — Terraform reads them from disk, not from the repo.
+build/
